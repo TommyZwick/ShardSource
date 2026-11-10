@@ -1,14 +1,13 @@
 local addonName = ...
 local addonVersion = C_AddOns.GetAddOnMetadata(addonName, "Version")
 if not addonVersion or addonVersion:find("@", 1, true) then addonVersion = "development" end
-local TRACKING_REVISION = "2026-11-08.2"
+local TRACKING_REVISION = "2026-11-10.1"
 local frame = CreateFrame("Frame")
 local SHARD_ID, PREFIX, UNKNOWN_SOUL = 6265, "ShardSrc", "Unknown"
 local ready, bankOpen, scanQueued = false, false, false
 local inventory, drain, pendingAction, recentLoss, sentCast = {}, nil, nil, nil, nil
 local trade, lastTrade = nil, nil
 local pendingDemon
-local nextOutdoorEmote = 0
 local observedDemon, demonRefund
 local recentGains, inventoryReady = {}, false
 local REFUND_WINDOW = 3
@@ -25,7 +24,6 @@ local whisperLines, targetRevision = {}, 0
 local ReceiveSoulWhisper
 local lastWhisperStatus = "No soul-name self-whisper attempted."
 local spellActions = {}
-local demonTypes = {}
 local hookedContainers = setmetatable({}, { __mode = "k" })
 
 local healthstones = { [5512]=true, [5511]=true, [5509]=true, [5510]=true, [9421]=true,
@@ -253,64 +251,7 @@ local function InitSpells()
         local name = C_Spell.GetSpellName(id)
         if PlainString(name) then spellActions[name] = action end
     end
-    for id, demonType in pairs({ [697]="Voidwalker", [712]="Succubus", [691]="Felhunter", [30146]="Felguard" }) do
-        local name = C_Spell.GetSpellName(id)
-        if PlainString(name) then demonTypes[name] = demonType end
-    end
 end
-
-local function OutdoorSummonEmote(kind, spell, target)
-    if not Shards.UseEmotes or not ChatAllowed() or GetTime() < nextOutdoorEmote then return end
-    -- Predict only the announcement. Actual consumption still determines saved sources.
-    for bag = 0, NUM_TOTAL_EQUIPPED_BAG_SLOTS or NUM_BAG_SLOTS do
-        for slot = 1, C_Container.GetContainerNumSlots(bag) do
-            local itemID = C_Container.GetContainerItemID(bag, slot)
-            if Readable(itemID) and itemID == SHARD_ID then
-                local guid = ItemGUID(bag, slot)
-                local source = guid and RecordedSource(Shards.sources[guid], sessionSouls[guid]) or UNKNOWN_SOUL
-                nextOutdoorEmote = GetTime()+10
-                if kind == "summon" then
-                    Emote("begins summoning " .. (target or "a player") .. " using the soul of " .. SoulName(source) .. ".")
-                else
-                    Emote("begins summoning a " .. (demonTypes[spell] or "demon") .. " using the soul of " .. SoulName(source) .. ".")
-                end
-                return
-            end
-        end
-    end
-end
-
-local function SummonAbilityPressed(spellID)
-    if not ready or not Readable(spellID) or type(spellID) ~= "number" or IsInInstance() then return end
-    local spell = C_Spell.GetSpellName(spellID)
-    if not PlainString(spell) then return end
-    local kind = spellActions[spell]
-    if kind ~= "demon" and kind ~= "summon" then return end
-    local target = kind == "summon" and GetUnitName("target", true)
-    -- Send synchronously from the action press. Events and timers lose its
-    -- hardware-input context. The shared cooldown also deduplicates nested hooks.
-    OutdoorSummonEmote(kind, spell, PlainString(target) and target or nil)
-end
-
-if UseAction then
-    hooksecurefunc("UseAction", function(slot)
-        if not ready or not Readable(slot) or type(slot) ~= "number" then return end
-        local spellID = C_ActionBar and C_ActionBar.GetSpell and C_ActionBar.GetSpell(slot)
-        if Readable(spellID) and type(spellID) == "number" then
-            SummonAbilityPressed(spellID)
-            return
-        end
-        local actionType, id = GetActionInfo(slot)
-        if not PlainString(actionType) or not Readable(id) or type(id) ~= "number" then return end
-        if actionType == "spell" then
-            SummonAbilityPressed(id)
-        elseif actionType == "macro" and GetMacroSpell then
-            SummonAbilityPressed(GetMacroSpell(id))
-        end
-    end)
-end
-if CastSpellByID then hooksecurefunc("CastSpellByID", SummonAbilityPressed) end
-if C_Spell.CastSpell then hooksecurefunc(C_Spell, "CastSpell", SummonAbilityPressed) end
 
 local function BindDemonSource()
     if not pendingDemon then return end
@@ -357,13 +298,9 @@ local function ApplyAction(action, source, soul)
             pendingDemon = { source=source, soul=soul, previousGUID=action.petGUID, expires=GetTime()+2 }
             BindDemonSource()
         end
-        if not action.startEmote then
-            Emote("used the soul of " .. SoulName(source) .. " to cast " .. action.spell .. ".")
-        end
+        Emote("used the soul of " .. SoulName(source) .. " to cast " .. action.spell .. ".")
     elseif action.kind == "summon" then
-        if not action.startEmote then
-            Emote("began summoning " .. (action.target or "a player") .. " using the soul of " .. SoulName(source) .. ".")
-        end
+        Emote("began summoning " .. (action.target or "a player") .. " using the soul of " .. SoulName(source) .. ".")
         SendSource("Smmn", source, action.target)
     elseif action.kind == "shatter" then
         Emote("shattered the soul of " .. SoulName(source) .. ", fading into the background.")
@@ -492,6 +429,8 @@ local function PaintButton(button)
         bag, slot = button:GetBankTabID(), button:GetContainerSlotID()
     elseif button.GetBagID and button.GetID then
         bag, slot = button:GetBagID(), button:GetID()
+    elseif button.GetBag and button.GetID then
+        bag, slot = button:GetBag(), button:GetID()
     else
         return
     end
@@ -531,15 +470,39 @@ local function PaintBank(panel)
     end
 end
 
-local function RefreshBags()
-    if not ContainerFrameUtil_EnumerateContainerFrames then return end
-    for _, container in ContainerFrameUtil_EnumerateContainerFrames() do
-        if not hookedContainers[container] and not InCombatLockdown() then
-            hookedContainers[container] = true
-            if container.UpdateItems then hooksecurefunc(container, "UpdateItems", PaintContainer) end
-            container:HookScript("OnShow", PaintContainer)
+local function PaintBagnonGroup(group)
+    if group.buttons then
+        for _, button in ipairs(group.buttons) do PaintButton(button) end
+    end
+end
+
+local hookedBagnonItemGroup
+local function RefreshBagnon()
+    local bagnon = _G.Bagnon
+    if not bagnon or not bagnon.ItemGroup then return end
+
+    if not hookedBagnonItemGroup then
+        hooksecurefunc(bagnon.ItemGroup, "Layout", PaintBagnonGroup)
+        hookedBagnonItemGroup = true
+    end
+
+    if bagnon.Frames then
+        for _, window in bagnon.Frames:Iterate() do
+            if window.ItemGroup then PaintBagnonGroup(window.ItemGroup) end
         end
-        PaintContainer(container)
+    end
+end
+
+local function RefreshBags()
+    if ContainerFrameUtil_EnumerateContainerFrames then
+        for _, container in ContainerFrameUtil_EnumerateContainerFrames() do
+            if not hookedContainers[container] and not InCombatLockdown() then
+                hookedContainers[container] = true
+                if container.UpdateItems then hooksecurefunc(container, "UpdateItems", PaintContainer) end
+                container:HookScript("OnShow", PaintContainer)
+            end
+            PaintContainer(container)
+        end
     end
     local panel = BankFrame and BankFrame.BankPanel
     if panel and panel.EnumerateValidItems then
@@ -550,6 +513,7 @@ local function RefreshBags()
         end
         PaintBank(panel)
     end
+    RefreshBagnon()
 end
 
 local function ResolveSoulWhispers()
@@ -765,9 +729,6 @@ local function SpellEvent(event, unit, castGUID, spellID)
             pendingAction, recentLoss = nil, nil
         else
             pendingAction = { kind=kind, spell=spellName, target=target, petGUID=petGUID, expires=GetTime()+2 }
-            -- Outdoors only the input hooks may announce, including when throttled.
-            pendingAction.startEmote = (kind == "demon" or kind == "summon")
-                and (not IsInInstance() or (sentCast and sentCast.startEmote))
             -- A new stone must not inherit an older stone's source if attribution fails.
             if kind == "health" then Shards.healthStoneSrc, healthSoul = UNKNOWN_SOUL, nil end
             if kind == "soul" then Shards.soulStoneSrc, stoneSoul = UNKNOWN_SOUL, nil end
@@ -815,7 +776,11 @@ end
 
 frame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
-        if ... ~= addonName then return end
+        local loadedAddon = ...
+        if loadedAddon ~= addonName then
+            if ready and loadedAddon == "Bagnon" then RefreshBags() end
+            return
+        end
         Shards = type(Shards) == "table" and Shards or {}
         Shards.sources = type(Shards.sources) == "table" and Shards.sources or {}
         -- Retire legacy creature-identity recovery without touching saved names.
@@ -876,8 +841,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             sentCast = nil
             if PlainString(guid) then
                 local petGUID = UnitGUID("pet")
-                sentCast = { target=PlainString(target) and target or nil, guid=guid,
-                    expires=GetTime()+30, startEmote=not IsInInstance() }
+                sentCast = { target=PlainString(target) and target or nil, guid=guid, expires=GetTime()+30 }
                 -- false means no previous pet; nil means its identity was unavailable.
                 if Readable(petGUID) and (petGUID == nil or PlainString(petGUID)) then
                     sentCast.petGUID = petGUID or false
